@@ -1,0 +1,45 @@
+name: evs image
+
+on:
+  push:
+    branches: [image-build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch, tag or commit to build
+        default: evs-hcs-support
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'evs-hcs-support' }}
+      - id: meta
+        run: |
+          echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/evs-csi-plugin" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cluster/images/evs-csi-plugin/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          push: true
+          build-args: VERSION=hcs-${{ steps.meta.outputs.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:hcs
+            ${{ steps.meta.outputs.image }}:hcs-${{ steps.meta.outputs.sha }}
