@@ -1,0 +1,190 @@
+# EVS CSI controller and node plugin for OpenShift or Kubernetes. The driver image is "evs-csi-plugin" here;
+# install.ps1 points it at a build in its generated overlay. The image's ENTRYPOINT starts the driver.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata: {name: evs.csi.huaweicloud.com}
+spec:
+  attachRequired: true
+  podInfoOnMount: true
+  volumeLifecycleModes: [Persistent, Ephemeral]
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata: {name: csi-evs-controller, namespace: kube-system}
+spec:
+  # two replicas: the sidecars elect a leader, so the standby takes over without a reschedule
+  replicas: 2
+  selector:
+    matchLabels: {app: csi-evs-provisioner}
+  template:
+    metadata:
+      labels: {app: csi-evs-provisioner}
+    spec:
+      serviceAccountName: csi-evs-controller-sa
+      priorityClassName: system-cluster-critical
+      nodeSelector: {kubernetes.io/os: linux}
+      # the controller only talks to the cloud API and the API server: no root, no host access (nonroot-v2 SCC)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      tolerations:
+      - {key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule}
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: csi-evs-provisioner}
+      containers:
+      - name: csi-attacher
+        image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0@sha256:3998c70f02511068e879b2222d7d4943db86fe044dd311f7bbb90812f778ad82
+        args: [--csi-address=$(ADDRESS), --timeout=3m, --leader-election=true]
+        env: [{name: ADDRESS, value: /var/lib/csi/sockets/pluginproxy/csi.sock}]
+        resources: {requests: {cpu: 10m, memory: 32Mi}}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+        volumeMounts: [{name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}]
+      - name: csi-provisioner
+        image: registry.k8s.io/sig-storage/csi-provisioner:v6.4.0@sha256:6ebe60fd8ed67a7f8a90d34402e9e706b274e53612d6fa5fbb8285728db622e2
+        args: [--csi-address=$(ADDRESS), --timeout=3m, --default-fstype=ext4, --feature-gates=Topology=true, --extra-create-metadata, --leader-election=true]
+        env: [{name: ADDRESS, value: /var/lib/csi/sockets/pluginproxy/csi.sock}]
+        resources: {requests: {cpu: 10m, memory: 32Mi}}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+        volumeMounts: [{name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}]
+      - name: csi-snapshotter
+        image: registry.k8s.io/sig-storage/csi-snapshotter:v8.7.0@sha256:b03d3334f8035fa42660b166f6eb819a659a14774da020eb1b6c52cd422eaadb
+        args: [--csi-address=$(ADDRESS), --timeout=3m, --extra-create-metadata, --leader-election=true]
+        env: [{name: ADDRESS, value: /var/lib/csi/sockets/pluginproxy/csi.sock}]
+        resources: {requests: {cpu: 10m, memory: 32Mi}}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+        volumeMounts: [{name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}]
+      - name: csi-resizer
+        image: registry.k8s.io/sig-storage/csi-resizer:v2.3.0@sha256:48fb3deb93cd848e3c8998b6368f4322c93bb5ce4a90d1307b6dda0dbefb9a0e
+        args: [--csi-address=$(ADDRESS), --timeout=3m, --handle-volume-inuse-error=false, --leader-election=true]
+        env: [{name: ADDRESS, value: /var/lib/csi/sockets/pluginproxy/csi.sock}]
+        resources: {requests: {cpu: 10m, memory: 32Mi}}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+        volumeMounts: [{name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}]
+      - name: liveness-probe
+        image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0@sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8
+        args: [--csi-address=$(ADDRESS)]
+        env: [{name: ADDRESS, value: /var/lib/csi/sockets/pluginproxy/csi.sock}]
+        resources: {requests: {cpu: 5m, memory: 16Mi}}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+        volumeMounts: [{name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}]
+      - name: evs-csi-provisioner
+        image: evs-csi-plugin
+        args: [-v=5, --endpoint=$(CSI_ENDPOINT), --cloud-config=$(CLOUD_CONFIG), --cluster=$(CLUSTER_NAME)]
+        env:
+        - {name: CSI_ENDPOINT, value: 'unix://csi/csi.sock'}
+        - {name: CLOUD_CONFIG, value: /etc/evs/cloud-config}
+        - {name: CLUSTER_NAME, value: kubernetes}
+        ports: [{containerPort: 9808, name: healthz, protocol: TCP}]
+        livenessProbe:
+          httpGet: {path: /healthz, port: healthz}
+          failureThreshold: 5
+          initialDelaySeconds: 30
+          timeoutSeconds: 10
+          periodSeconds: 30
+        resources: {requests: {cpu: 20m, memory: 64Mi}}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+        - {name: evs-config, mountPath: /etc/evs/, readOnly: true}
+      volumes:
+      - {name: socket-dir, emptyDir: {}}
+      - {name: evs-config, secret: {secretName: cloud-config, defaultMode: 0440}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: csi-evs-controller, namespace: kube-system}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: csi-evs-provisioner}
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata: {name: csi-evs-plugin, namespace: kube-system}
+spec:
+  selector:
+    matchLabels: {app: csi-evs-plugin}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: csi-evs-plugin}
+    spec:
+      serviceAccountName: csi-evs-node-sa
+      priorityClassName: system-node-critical
+      # host network: the node plugin reads the ECS id and AZ from 169.254.169.254, which some networks (HCS with
+      # OVN-Kubernetes) route only from the host, not from pods
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: evs-driver-registrar
+        image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:692a30d9f27d32a25ea2784d01251b73e189e9d1156dd43c58f87ad2b70ec1e6
+        args: [--v=5, --csi-address=$(ADDRESS), --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)]
+        env:
+        - {name: ADDRESS, value: /csi/csi.sock}
+        - {name: DRIVER_REG_SOCK_PATH, value: /var/lib/kubelet/plugins/evs.csi.huaweicloud.com/csi.sock}
+        - name: KUBE_NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        resources: {requests: {cpu: 5m, memory: 16Mi}}
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+        - {name: registration-dir, mountPath: /registration}
+      - name: liveness-probe
+        image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0@sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8
+        # host network: keep clear of 9808, which other CSI node plugins on the host may use
+        args: [--csi-address=/csi/csi.sock, --http-endpoint=:9818]
+        resources: {requests: {cpu: 5m, memory: 16Mi}}
+        volumeMounts: [{name: socket-dir, mountPath: /csi}]
+      - name: evs-csi-plugin
+        image: evs-csi-plugin
+        args: [--v=5, --endpoint=$(CSI_ENDPOINT), --cloud-config=$(CLOUD_CONFIG)]
+        env:
+        - {name: CSI_ENDPOINT, value: 'unix://csi/csi.sock'}
+        - {name: CLOUD_CONFIG, value: /etc/evs/cloud-config}
+        securityContext:
+          privileged: true
+          capabilities: {add: [SYS_ADMIN], drop: [all]}
+          readOnlyRootFilesystem: true
+        ports: [{containerPort: 9818, name: healthz, protocol: TCP}]
+        livenessProbe:
+          httpGet: {path: /healthz, port: healthz}
+          failureThreshold: 5
+          initialDelaySeconds: 30
+          timeoutSeconds: 10
+          periodSeconds: 30
+        resources: {requests: {cpu: 20m, memory: 64Mi}}
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+        - {name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional}
+        - {name: pass-pods-mount-dir, mountPath: /mnt/paas/kubernetes/kubelet, mountPropagation: Bidirectional}
+        - {name: pods-probe-dir, mountPath: /dev, mountPropagation: HostToContainer}
+        - {name: host-sys, mountPath: /sys, readOnly: true}
+        - {name: host-run-udev, mountPath: /run/udev, readOnly: true}
+        - {name: evs-config, mountPath: /etc/evs/, readOnly: true}
+      volumes:
+      - {name: socket-dir, hostPath: {path: /var/lib/kubelet/plugins/evs.csi.huaweicloud.com, type: DirectoryOrCreate}}
+      - {name: registration-dir, hostPath: {path: /var/lib/kubelet/plugins_registry/, type: Directory}}
+      - {name: kubelet-dir, hostPath: {path: /var/lib/kubelet, type: Directory}}
+      - {name: pass-pods-mount-dir, hostPath: {path: /mnt/paas/kubernetes/kubelet, type: DirectoryOrCreate}}
+      - {name: pods-probe-dir, hostPath: {path: /dev, type: Directory}}
+      - {name: host-sys, hostPath: {path: /sys, type: Directory}}
+      - {name: host-run-udev, hostPath: {path: /run/udev, type: Directory}}
+      - {name: evs-config, secret: {secretName: cloud-config, defaultMode: 0400}}
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: evs-snap
+  labels: {velero.io/csi-volumesnapshot-class: 'true'}
+driver: evs.csi.huaweicloud.com
+deletionPolicy: Retain
